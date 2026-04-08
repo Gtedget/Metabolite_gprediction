@@ -9,7 +9,9 @@ import pandas as pd
 import argparse
 import json
 import os
+from datetime import datetime
 from cid_lookup import cid_to_smiles
+from tqdm.auto import tqdm
 
 try:
     import mlflow
@@ -27,6 +29,16 @@ def resolve_best_model_out(model_out):
     if not ext:
         ext = ".pt"
     return f"{root}.best{ext}"
+
+
+def default_run_name():
+    return datetime.utcnow().strftime("run_%Y%m%d_%H%M%S")
+
+
+def resolve_output_path(output_dir, run_name, provided_path, default_filename):
+    if provided_path and provided_path != default_filename:
+        return provided_path
+    return os.path.join(output_dir, run_name, default_filename)
 
 
 def log_message(message, log_file=None):
@@ -56,6 +68,8 @@ def setup_mlflow(args, train_df, val_df=None, test_df=None):
             "lr": args.lr,
             "representation": args.representation,
             "max_len": args.max_len,
+            "run_name": args.run_name,
+            "output_dir": args.output_dir,
             "device": args.device,
             "use_enzyme_head": args.use_enzyme_head,
             "train_rows": len(train_df),
@@ -158,12 +172,16 @@ def train_step(model, batch, optimizer, criterion_ce, device, use_enzyme_head=Fa
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion_ce, device, use_enzyme_head=False):
+def evaluate(model, loader, criterion_ce, device, use_enzyme_head=False, progress_desc=None, show_progress=False):
     model.eval()
     losses = []
     transform_accuracies = []
 
-    for batch in loader:
+    batch_iter = loader
+    if show_progress:
+        batch_iter = tqdm(loader, desc=progress_desc, leave=False)
+
+    for batch in batch_iter:
         loss, transform_accuracy = compute_batch_loss(
             model,
             batch,
@@ -189,6 +207,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--representation", choices=["smiles", "selfies"], default="selfies")
     parser.add_argument("--max_len", type=int, default=128)
+    parser.add_argument("--output_dir", default="artifacts", help="Base directory for run outputs when default artifact names are used")
+    parser.add_argument("--run_name", default=None, help="Optional run name used for artifact subdirectories and MLflow")
     parser.add_argument("--log_file", default=None, help="Optional path to append training progress logs")
     parser.add_argument("--val_data", default=None, help="Validation CSV path. Defaults to a sibling val.csv when present")
     parser.add_argument("--test_data", default=None, help="Test CSV path. Defaults to a sibling test.csv when present")
@@ -206,12 +226,29 @@ def main():
     parser.add_argument("--mlflow_experiment", default="metabolite-predictor", help="MLflow experiment name")
     parser.add_argument("--mlflow_run_name", default=None, help="Optional MLflow run name")
     parser.add_argument("--mlflow_tracking_uri", default=None, help="MLflow tracking URI, e.g. file:/content/mlruns in Colab")
+    parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars")
     parser.add_argument(
         "--use_enzyme_head",
         action="store_true",
         help="Enable the enzyme classification head. Disabled by default because enzyme labels are often multi-valued.",
     )
     args = parser.parse_args()
+
+    if args.run_name is None:
+        args.run_name = default_run_name()
+    if args.mlflow_run_name is None:
+        args.mlflow_run_name = args.run_name
+
+    args.model_out = resolve_output_path(args.output_dir, args.run_name, args.model_out, "trained_model.pt")
+    if args.best_model_out is None:
+        args.best_model_out = os.path.join(args.output_dir, args.run_name, "trained_model.best.pt")
+    args.metadata_out = resolve_output_path(args.output_dir, args.run_name, args.metadata_out, "trained_model.metadata.json")
+    if args.log_file is None:
+        args.log_file = os.path.join(args.output_dir, args.run_name, "train.log")
+
+    for path in [args.model_out, args.best_model_out, args.metadata_out, args.log_file]:
+        if path:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
     if args.log_file:
         with open(args.log_file, "w", encoding="utf-8"):
@@ -289,11 +326,16 @@ def main():
     criterion_ce = nn.CrossEntropyLoss()
     best_val_loss = None
     best_epoch = None
+    show_progress = not args.no_progress
 
     for epoch in range(args.epochs):
         losses = []
         train_transform_accuracies = []
-        for batch in loader:
+        batch_iter = loader
+        if show_progress:
+            batch_iter = tqdm(loader, desc=f"Epoch {epoch + 1}/{args.epochs}", leave=False)
+
+        for batch in batch_iter:
             loss, transform_accuracy = train_step(
                 model,
                 batch,
@@ -304,6 +346,8 @@ def main():
             )
             losses.append(loss)
             train_transform_accuracies.append(transform_accuracy)
+            if show_progress:
+                batch_iter.set_postfix(loss=f"{loss:.4f}", transform_acc=f"{transform_accuracy:.3f}")
 
         train_loss = sum(losses) / len(losses)
         train_transform_accuracy = sum(train_transform_accuracies) / len(train_transform_accuracies)
@@ -315,6 +359,8 @@ def main():
                 criterion_ce,
                 device,
                 use_enzyme_head=args.use_enzyme_head,
+                progress_desc="Validation",
+                show_progress=show_progress,
             )
             log_message(
                 f"Epoch {epoch}: train_loss={train_loss:.4f} "
@@ -369,6 +415,8 @@ def main():
             criterion_ce,
             device,
             use_enzyme_head=args.use_enzyme_head,
+            progress_desc="Test",
+            show_progress=show_progress,
         )
         log_message(
             f"Test: loss={test_metrics['loss']:.4f} "

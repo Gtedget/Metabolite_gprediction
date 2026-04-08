@@ -3,12 +3,18 @@ import json
 import os
 
 import pandas as pd
+from tqdm.auto import tqdm
 from inference import (
     _resolve_device,
     beam_search_candidates,
     canonicalize_smiles,
     load_model,
 )
+
+try:
+    import mlflow
+except ImportError:
+    mlflow = None
 
 
 def main():
@@ -21,7 +27,35 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Optional row limit for quick evaluation")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--out", default=None, help="Optional JSON path to save evaluation metrics")
+    parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars")
+    parser.add_argument("--use_mlflow", action="store_true", help="Log evaluation params, metrics, and artifacts to MLflow")
+    parser.add_argument("--mlflow_experiment", default="metabolite-generation-eval", help="MLflow experiment name")
+    parser.add_argument("--mlflow_run_name", default=None, help="Optional MLflow run name")
+    parser.add_argument("--mlflow_tracking_uri", default=None, help="MLflow tracking URI, e.g. file:/content/mlruns in Colab")
     args = parser.parse_args()
+
+    if args.use_mlflow:
+        if mlflow is None:
+            raise ImportError("mlflow is not installed. Install requirements.txt before using --use_mlflow.")
+        if args.out is None:
+            model_dir = os.path.dirname(os.path.abspath(args.model)) or "."
+            args.out = os.path.join(model_dir, "generation_eval.json")
+        if args.mlflow_tracking_uri:
+            mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+        if args.mlflow_experiment:
+            mlflow.set_experiment(args.mlflow_experiment)
+        mlflow.start_run(run_name=args.mlflow_run_name)
+        mlflow.log_params(
+            {
+                "data": args.data,
+                "model": args.model,
+                "metadata": args.metadata,
+                "top_k": args.top_k,
+                "beam_width": args.beam_width,
+                "limit": args.limit,
+                "device": args.device,
+            }
+        )
 
     df = pd.read_csv(args.data)
     if args.limit and args.limit > 0:
@@ -42,7 +76,8 @@ def main():
     exact_topk = 0
     unique_candidate_counts = []
 
-    for _, row in df.iterrows():
+    row_iter = tqdm(df.iterrows(), total=len(df), desc="Generation eval", disable=args.no_progress)
+    for _, row in row_iter:
         expected = canonicalize_smiles(str(row["Metabolite_SMILES"]).strip())
         precursor = str(row["Parent_SMILES"]).strip()
         if not expected or not precursor:
@@ -72,6 +107,8 @@ def main():
         if expected in candidate_canonicals:
             exact_topk += 1
 
+        row_iter.set_postfix(valid_top1=valid_top1, exact_top1=exact_top1, evaluated=total_rows)
+
     metrics = {
         "rows_evaluated": total_rows,
         "top1_valid_rate": valid_top1 / total_rows if total_rows else 0.0,
@@ -91,6 +128,12 @@ def main():
             os.makedirs(out_dir, exist_ok=True)
         with open(args.out, "w") as f:
             json.dump(metrics, f, indent=2)
+
+    if args.use_mlflow:
+        mlflow.log_metrics(metrics)
+        if args.out and os.path.exists(args.out):
+            mlflow.log_artifact(args.out)
+        mlflow.end_run()
 
 
 if __name__ == "__main__":

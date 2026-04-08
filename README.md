@@ -72,6 +72,7 @@ Quick path:
 - run `train.py` with `--device cuda --use_mlflow`
 
 Full Colab instructions are in [COLAB.md](COLAB.md).
+The ready-to-run notebook is [colab/Metabolite_GPrediction_Colab.ipynb](colab/Metabolite_GPrediction_Colab.ipynb).
 
 
 Preprocess
@@ -101,6 +102,8 @@ Train on the split CSV (default: train.csv) and save:
 - trained_model.best.pt (best validation-loss checkpoint when validation data is available)
 - trained_model.metadata.json (includes class counts + maps)
 
+By default, the current training script writes those files into `artifacts/<run_name>/`, where `run_name` is a timestamp such as `run_20260408_153000`. This avoids Colab runs overwriting each other. You can override that with `--output_dir` and `--run_name`, or still pass explicit artifact paths if needed.
+
 By default, training uses SMILES generation + transformation prediction only. The enzyme head is off unless you pass `--use_enzyme_head`.
 When sibling [Project-1/val.csv](Project-1/val.csv) and [Project-1/test.csv](Project-1/test.csv) files are present, training evaluates validation loss and transformation accuracy each epoch, saves the best validation-loss checkpoint, and reports final test metrics at the end.
 The decoder target representation defaults to SELFIES (`--representation selfies`) because it is substantially more robust than raw SMILES for sequence generation.
@@ -108,7 +111,7 @@ The decoder target representation defaults to SELFIES (`--representation selfies
 Example:
 
 ```powershell
-python Project-1\train.py --data Project-1\train.csv --epochs 20 --batch_size 16 --lr 1e-4 --model_out Project-1\trained_model.pt --metadata_out Project-1\trained_model.metadata.json
+python Project-1\train.py --data Project-1\train.csv --epochs 20 --batch_size 16 --lr 1e-4 --output_dir Project-1\artifacts --run_name local_smoketest
 ```
 
 
@@ -128,10 +131,10 @@ Generation evaluation
 To evaluate structure generation on a split using canonical SMILES exact-match metrics:
 
 ```powershell
-python Project-1\evaluate_generation.py --data Project-1\test.csv --model Project-1\trained_model.best.pt --metadata Project-1\trained_model.metadata.json --top_k 5 --beam_width 5
+python Project-1\evaluate_generation.py --data Project-1\test.csv --model Project-1\artifacts\local_smoketest\trained_model.best.pt --metadata Project-1\artifacts\local_smoketest\trained_model.metadata.json --top_k 5 --beam_width 5 --use_mlflow
 ```
 
-This reports top-1 validity, top-k validity, top-1 exact canonical match rate, top-k exact canonical match rate, and average number of unique valid candidates per row.
+This reports top-1 validity, top-k validity, top-1 exact canonical match rate, top-k exact canonical match rate, and average number of unique valid candidates per row. With `--use_mlflow`, those metrics are also logged to MLflow and the optional JSON output is stored as an artifact.
 
 
 Common issues

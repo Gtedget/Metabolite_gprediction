@@ -9,9 +9,8 @@ entry_points:
       lr: {type: float, default: 0.0001}
       device: {type: str, default: auto}
       representation: {type: str, default: selfies}
-      model_out: {type: str, default: trained_model.pt}
-      best_model_out: {type: str, default: trained_model.best.pt}
-      metadata_out: {type: str, default: trained_model.metadata.json}
+      output_dir: {type: str, default: artifacts}
+      run_name: {type: str, default: mlflow_project_run}
       mlflow_experiment: {type: str, default: metabolite-predictor}
       mlflow_tracking_uri: {type: str, default: file:./mlruns}
     command: >
@@ -22,9 +21,8 @@ entry_points:
       --lr {lr}
       --device {device}
       --representation {representation}
-      --model_out {model_out}
-      --best_model_out {best_model_out}
-      --metadata_out {metadata_out}
+      --output_dir {output_dir}
+      --run_name {run_name}
       --use_mlflow
       --mlflow_experiment "{mlflow_experiment}"
       --mlflow_tracking_uri "{mlflow_tracking_uri}"
@@ -32,11 +30,14 @@ entry_points:
   evaluate_generation:
     parameters:
       data: {type: str, default: test.csv}
-      model: {type: str, default: trained_model.best.pt}
-      metadata: {type: str, default: trained_model.metadata.json}
+      model: {type: str, default: artifacts/mlflow_project_run/trained_model.best.pt}
+      metadata: {type: str, default: artifacts/mlflow_project_run/trained_model.metadata.json}
       top_k: {type: int, default: 5}
       beam_width: {type: int, default: 5}
       device: {type: str, default: auto}
+      mlflow_experiment: {type: str, default: metabolite-generation-eval}
+      mlflow_run_name: {type: str, default: mlflow_project_run-eval}
+      mlflow_tracking_uri: {type: str, default: file:./mlruns}
     command: >
       python evaluate_generation.py
       --data {data}
@@ -45,3 +46,7 @@ entry_points:
       --top_k {top_k}
       --beam_width {beam_width}
       --device {device}
+      --use_mlflow
+      --mlflow_experiment "{mlflow_experiment}"
+      --mlflow_run_name "{mlflow_run_name}"
+      --mlflow_tracking_uri "{mlflow_tracking_uri}"
