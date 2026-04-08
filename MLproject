@@ -1,0 +1,47 @@
+name: metabolite-gprediction
+
+entry_points:
+  train:
+    parameters:
+      data: {type: str, default: train.csv}
+      epochs: {type: int, default: 20}
+      batch_size: {type: int, default: 16}
+      lr: {type: float, default: 0.0001}
+      device: {type: str, default: auto}
+      representation: {type: str, default: selfies}
+      model_out: {type: str, default: trained_model.pt}
+      best_model_out: {type: str, default: trained_model.best.pt}
+      metadata_out: {type: str, default: trained_model.metadata.json}
+      mlflow_experiment: {type: str, default: metabolite-predictor}
+      mlflow_tracking_uri: {type: str, default: file:./mlruns}
+    command: >
+      python train.py
+      --data {data}
+      --epochs {epochs}
+      --batch_size {batch_size}
+      --lr {lr}
+      --device {device}
+      --representation {representation}
+      --model_out {model_out}
+      --best_model_out {best_model_out}
+      --metadata_out {metadata_out}
+      --use_mlflow
+      --mlflow_experiment "{mlflow_experiment}"
+      --mlflow_tracking_uri "{mlflow_tracking_uri}"
+
+  evaluate_generation:
+    parameters:
+      data: {type: str, default: test.csv}
+      model: {type: str, default: trained_model.best.pt}
+      metadata: {type: str, default: trained_model.metadata.json}
+      top_k: {type: int, default: 5}
+      beam_width: {type: int, default: 5}
+      device: {type: str, default: auto}
+    command: >
+      python evaluate_generation.py
+      --data {data}
+      --model {model}
+      --metadata {metadata}
+      --top_k {top_k}
+      --beam_width {beam_width}
+      --device {device}

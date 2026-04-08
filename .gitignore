@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+mlruns/
+*.log
+*.pt
+*.metadata.json
+*.stdout.log
+*.stderr.log
+trained_model*.json
+generation_eval*.json
+processed_metabolism_data.csv
+README.md.txt
+Zotepine_deeporiginprofile.txt
