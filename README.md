@@ -8,6 +8,14 @@ This folder contains a minimal end-to-end pipeline for learning a precursor->met
 - The enzyme head is disabled by default because enzyme labels in this dataset are often multi-valued.
 
 
+Recent updates
+
+- Training now ignores padded target tokens in the sequence loss and trims each batch to its effective target length. This avoids spending most of the learning signal on `<pad>` tokens and improves training efficiency.
+- Decoder attention now respects target padding masks.
+- Inference suppresses `<pad>` generation and supports `--no_repeat_ngram_size` to reduce repetitive degenerate metabolite strings.
+- Inference can optionally report SoM-like atom scores from the auxiliary reaction-center head and render them as an SVG.
+
+
 Project structure
 
 - cid_lookup.py
@@ -104,7 +112,15 @@ Train on the split CSV (default: train.csv) and save:
 
 By default, the current training script writes those files into `artifacts/<run_name>/`, where `run_name` is a timestamp such as `run_20260408_153000`. This avoids Colab runs overwriting each other. You can override that with `--output_dir` and `--run_name`, or still pass explicit artifact paths if needed.
 
-By default, training uses SMILES generation + transformation prediction only. The enzyme head is off unless you pass `--use_enzyme_head`.
+Training is multi-task:
+- the main objective is metabolite sequence generation
+- an auxiliary head predicts the detailed transformation class
+- an auxiliary head predicts a coarse transformation family
+- an auxiliary head predicts a reaction-center / SoM-like atom signal inferred from the parent/metabolite pair
+
+The sequence loss ignores `<pad>` tokens, and each batch is trimmed to its effective sequence length before decoding. This is important for this dataset because a large fraction of the fixed-length target tensor is padding.
+
+By default, training uses sequence generation plus the transformation and reaction-center auxiliary heads. The enzyme head is off unless you pass `--use_enzyme_head`.
 When sibling [Project-1/val.csv](Project-1/val.csv) and [Project-1/test.csv](Project-1/test.csv) files are present, training evaluates validation loss and transformation accuracy each epoch, saves the best validation-loss checkpoint, and reports final test metrics at the end.
 The decoder target representation defaults to SELFIES (`--representation selfies`) because it is substantially more robust than raw SMILES for sequence generation.
 
@@ -123,9 +139,13 @@ This generates a metabolite SMILES from a precursor SMILES string:
 python Project-1\inference.py --model Project-1\trained_model.pt --metadata Project-1\trained_model.metadata.json
 ```
 
-Then enter a precursor SMILES when prompted. Use `--top_k 5 --beam_width 5` to return multiple ranked metabolite candidates instead of a single greedy output. Use `--no_repeat_ngram_size 3` to reduce repetitive degenerate strings during decoding.
+Then enter a precursor SMILES when prompted.
 
-Inference now also reports the highest-scoring site-of-metabolism-like atoms from the model's reaction-center head. These are heuristic atom-level scores derived from the auxiliary reaction-center task, not curated SoM labels.
+Key decoding options:
+- `--top_k 5 --beam_width 5` returns multiple ranked metabolite candidates instead of a single greedy output.
+- `--no_repeat_ngram_size 3` blocks repeated n-grams during decoding and is useful when the model starts producing long repetitive strings.
+
+Inference can also report the highest-scoring site-of-metabolism-like atoms from the model's reaction-center head. These are heuristic atom-level scores derived from the auxiliary reaction-center task, not curated SoM labels.
 
 For scripted inference, pass the precursor directly and optionally save a combined JSON payload:
 
