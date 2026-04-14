@@ -67,7 +67,7 @@ def main():
         raise ValueError(f"Evaluation CSV is missing required columns: {sorted(missing)}")
 
     device = _resolve_device(args.device)
-    model, tokenizer, _ = load_model(args.model, args.metadata, device)
+    model, tokenizer, metadata = load_model(args.model, args.metadata, device)
 
     total_rows = 0
     valid_top1 = 0
@@ -88,6 +88,7 @@ def main():
             tokenizer,
             precursor,
             device,
+            metadata=metadata,
             num_candidates=args.top_k,
             beam_width=args.beam_width,
         )

@@ -123,7 +123,21 @@ This generates a metabolite SMILES from a precursor SMILES string:
 python Project-1\inference.py --model Project-1\trained_model.pt --metadata Project-1\trained_model.metadata.json
 ```
 
-Then enter a precursor SMILES when prompted. Use `--top_k 5 --beam_width 5` to return multiple ranked metabolite candidates instead of a single greedy output.
+Then enter a precursor SMILES when prompted. Use `--top_k 5 --beam_width 5` to return multiple ranked metabolite candidates instead of a single greedy output. Use `--no_repeat_ngram_size 3` to reduce repetitive degenerate strings during decoding.
+
+Inference now also reports the highest-scoring site-of-metabolism-like atoms from the model's reaction-center head. These are heuristic atom-level scores derived from the auxiliary reaction-center task, not curated SoM labels.
+
+For scripted inference, pass the precursor directly and optionally save a combined JSON payload:
+
+```powershell
+python Project-1\inference.py --model Project-1\artifacts\local_smoketest\trained_model.best.pt --metadata Project-1\artifacts\local_smoketest\trained_model.metadata.json --precursor "CCO" --top_k 5 --beam_width 5 --no_repeat_ngram_size 3 --som_top_k 5 --json_out Project-1\artifacts\local_smoketest\inference.json
+```
+
+You can also render an SVG of the precursor with the top predicted SoM-like atoms highlighted:
+
+```powershell
+python Project-1\inference.py --model Project-1\artifacts\local_smoketest\trained_model.best.pt --metadata Project-1\artifacts\local_smoketest\trained_model.metadata.json --precursor "CCO" --som_top_k 5 --som_svg_out Project-1\artifacts\local_smoketest\som.svg
+```
 
 
 Generation evaluation

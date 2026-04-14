@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 from torch_geometric.loader import DataLoader
-from data_utils import MetaboliteDataset, SmilesTokenizer
+from data_utils import BOND_FEATURE_DIM, ATOM_FEATURE_DIM, MetaboliteDataset, SmilesTokenizer, normalize_transformation_family
 from model import MetaboliteGenerator
 import pandas as pd
 import argparse
@@ -121,30 +121,94 @@ def build_tokenizer(args, train_df, val_df=None, test_df=None):
     )
 
 
-def compute_batch_loss(model, batch, criterion_ce, device, use_enzyme_head=False):
-    graph, tgt_tokens, y_transform, y_enzyme = batch
+def build_class_weights(df, column_name, label_map):
+    counts = df[column_name].value_counts()
+    num_classes = max(1, len(label_map))
+    total = max(1, len(df))
+    weights = []
+    for label, index in sorted(label_map.items(), key=lambda item: item[1]):
+        count = int(counts.get(label, 0))
+        if count <= 0:
+            weights.append(1.0)
+            continue
+        weights.append(total / (num_classes * count))
+
+    weights = torch.tensor(weights, dtype=torch.float)
+    return weights / weights.mean()
+
+
+def build_coarse_transform_map(train_df, val_df=None, test_df=None):
+    frames = [train_df]
+    if val_df is not None:
+        frames.append(val_df)
+    if test_df is not None:
+        frames.append(test_df)
+
+    coarse_labels = []
+    for frame in frames:
+        coarse_labels.extend(normalize_transformation_family(value) for value in frame["Transformation"].dropna().tolist())
+
+    coarse_labels = sorted(set(coarse_labels))
+    return {label: idx for idx, label in enumerate(coarse_labels)}
+
+
+def compute_batch_loss(
+    model,
+    batch,
+    sequence_criterion,
+    transform_criterion,
+    coarse_transform_criterion,
+    reaction_center_criterion,
+    enzyme_criterion,
+    device,
+    transform_loss_weight=0.5,
+    coarse_transform_loss_weight=0.2,
+    reaction_center_loss_weight=0.2,
+    enzyme_loss_weight=0.3,
+    use_enzyme_head=False,
+):
+    graph, tgt_tokens, y_transform, y_coarse_transform, y_enzyme = batch
 
     graph = graph.to(device)
     tgt_tokens = tgt_tokens.to(device)
     y_transform = y_transform.to(device)
+    y_coarse_transform = y_coarse_transform.to(device)
     if use_enzyme_head:
         y_enzyme = y_enzyme.to(device)
 
-    logits, pred_transform, pred_enzyme = model(graph, tgt_tokens[:, :-1])
+    non_pad_lengths = tgt_tokens.ne(0).sum(dim=1)
+    effective_tgt_len = max(2, int(non_pad_lengths.max().item()))
+    tgt_tokens = tgt_tokens[:, :effective_tgt_len]
 
-    # SMILES generation loss
-    loss_smiles = criterion_ce(
+    logits, pred_transform, pred_coarse_transform, pred_reaction_center, pred_enzyme = model(
+        graph,
+        tgt_tokens[:, :-1],
+        transform_labels=y_transform,
+        coarse_transform_labels=y_coarse_transform,
+    )
+
+    loss_smiles = sequence_criterion(
         logits.reshape(-1, logits.size(-1)),
         tgt_tokens[:, 1:].reshape(-1)
     )
 
-    # Multi-task loss
-    loss_transform = criterion_ce(pred_transform, y_transform)
+    loss_transform = transform_criterion(pred_transform, y_transform)
+    loss_coarse_transform = coarse_transform_criterion(pred_coarse_transform, y_coarse_transform)
+    reaction_center_targets = getattr(graph, "reaction_center_target", None)
+    if reaction_center_targets is None:
+        reaction_center_targets = torch.zeros_like(pred_reaction_center)
+    reaction_center_targets = reaction_center_targets.to(device).float()
+    loss_reaction_center = reaction_center_criterion(pred_reaction_center, reaction_center_targets)
 
-    loss = loss_smiles + 0.3 * loss_transform
+    loss = (
+        loss_smiles
+        + transform_loss_weight * loss_transform
+        + coarse_transform_loss_weight * loss_coarse_transform
+        + reaction_center_loss_weight * loss_reaction_center
+    )
     if use_enzyme_head and pred_enzyme is not None:
-        loss_enzyme = criterion_ce(pred_enzyme, y_enzyme)
-        loss = loss + 0.3 * loss_enzyme
+        loss_enzyme = enzyme_criterion(pred_enzyme, y_enzyme)
+        loss = loss + enzyme_loss_weight * loss_enzyme
 
     transform_accuracy = (pred_transform.argmax(dim=1) == y_transform).float().mean().item()
 
@@ -154,14 +218,37 @@ def compute_batch_loss(model, batch, criterion_ce, device, use_enzyme_head=False
 # -----------------------------------------------------
 # 1. Training step
 # -----------------------------------------------------
-def train_step(model, batch, optimizer, criterion_ce, device, use_enzyme_head=False):
+def train_step(
+    model,
+    batch,
+    optimizer,
+    sequence_criterion,
+    transform_criterion,
+    coarse_transform_criterion,
+    reaction_center_criterion,
+    enzyme_criterion,
+    device,
+    transform_loss_weight=0.5,
+    coarse_transform_loss_weight=0.2,
+    reaction_center_loss_weight=0.2,
+    enzyme_loss_weight=0.3,
+    use_enzyme_head=False,
+):
     optimizer.zero_grad()
 
     loss, transform_accuracy = compute_batch_loss(
         model,
         batch,
-        criterion_ce,
+        sequence_criterion,
+        transform_criterion,
+        coarse_transform_criterion,
+        reaction_center_criterion,
+        enzyme_criterion,
         device,
+        transform_loss_weight=transform_loss_weight,
+        coarse_transform_loss_weight=coarse_transform_loss_weight,
+        reaction_center_loss_weight=reaction_center_loss_weight,
+        enzyme_loss_weight=enzyme_loss_weight,
         use_enzyme_head=use_enzyme_head,
     )
 
@@ -172,7 +259,23 @@ def train_step(model, batch, optimizer, criterion_ce, device, use_enzyme_head=Fa
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion_ce, device, use_enzyme_head=False, progress_desc=None, show_progress=False):
+def evaluate(
+    model,
+    loader,
+    sequence_criterion,
+    transform_criterion,
+    coarse_transform_criterion,
+    reaction_center_criterion,
+    enzyme_criterion,
+    device,
+    transform_loss_weight=0.5,
+    coarse_transform_loss_weight=0.2,
+    reaction_center_loss_weight=0.2,
+    enzyme_loss_weight=0.3,
+    use_enzyme_head=False,
+    progress_desc=None,
+    show_progress=False,
+):
     model.eval()
     losses = []
     transform_accuracies = []
@@ -185,8 +288,16 @@ def evaluate(model, loader, criterion_ce, device, use_enzyme_head=False, progres
         loss, transform_accuracy = compute_batch_loss(
             model,
             batch,
-            criterion_ce,
+            sequence_criterion,
+            transform_criterion,
+            coarse_transform_criterion,
+            reaction_center_criterion,
+            enzyme_criterion,
             device,
+            transform_loss_weight=transform_loss_weight,
+            coarse_transform_loss_weight=coarse_transform_loss_weight,
+            reaction_center_loss_weight=reaction_center_loss_weight,
+            enzyme_loss_weight=enzyme_loss_weight,
             use_enzyme_head=use_enzyme_head,
         )
         losses.append(loss.item())
@@ -227,6 +338,12 @@ def main():
     parser.add_argument("--mlflow_run_name", default=None, help="Optional MLflow run name")
     parser.add_argument("--mlflow_tracking_uri", default=None, help="MLflow tracking URI, e.g. file:/content/mlruns in Colab")
     parser.add_argument("--no_progress", action="store_true", help="Disable tqdm progress bars")
+    parser.add_argument("--transform_loss_weight", type=float, default=0.5, help="Weight applied to the transformation classification loss")
+    parser.add_argument("--coarse_transform_loss_weight", type=float, default=0.2, help="Weight applied to the coarse transformation-family classification loss")
+    parser.add_argument("--reaction_center_loss_weight", type=float, default=0.2, help="Weight applied to the reaction-center prediction loss")
+    parser.add_argument("--enzyme_loss_weight", type=float, default=0.3, help="Weight applied to the enzyme classification loss when enabled")
+    parser.add_argument("--label_smoothing", type=float, default=0.0, help="Optional label smoothing applied to sequence and classification cross-entropy losses")
+    parser.add_argument("--balance_transform_classes", action="store_true", help="Use inverse-frequency class weights for the transformation loss")
     parser.add_argument(
         "--use_enzyme_head",
         action="store_true",
@@ -283,13 +400,15 @@ def main():
 
     transform_map = load_label_map(args.transform_map, "Transformation", df)
     enzyme_map = load_label_map(args.enzyme_map, "Enzyme", df)
+    coarse_transform_map = build_coarse_transform_map(df, val_df=val_df, test_df=test_df)
 
     dataset = MetaboliteDataset(
         df=df,
         smiles_lookup_fn=cid_to_smiles,
         tokenizer=tokenizer,
         transform_map=transform_map,
-        enzyme_map=enzyme_map
+        enzyme_map=enzyme_map,
+        coarse_transform_map=coarse_transform_map,
     )
 
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
@@ -301,6 +420,7 @@ def main():
             tokenizer=tokenizer,
             transform_map=transform_map,
             enzyme_map=enzyme_map,
+            coarse_transform_map=coarse_transform_map,
         )
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
@@ -312,18 +432,30 @@ def main():
             tokenizer=tokenizer,
             transform_map=transform_map,
             enzyme_map=enzyme_map,
+            coarse_transform_map=coarse_transform_map,
         )
         test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
     model = MetaboliteGenerator(
         vocab_size=len(tokenizer.vocab),
         num_transform_classes=len(transform_map),
+        num_coarse_transform_classes=len(coarse_transform_map),
         num_enzyme_classes=len(enzyme_map),
+        atom_feature_dim=ATOM_FEATURE_DIM,
+        bond_feature_dim=BOND_FEATURE_DIM,
+        max_len=tokenizer.max_len,
         use_enzyme_head=args.use_enzyme_head,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion_ce = nn.CrossEntropyLoss()
+    sequence_criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=args.label_smoothing)
+    transform_class_weights = None
+    if args.balance_transform_classes:
+        transform_class_weights = build_class_weights(df, "Transformation", transform_map).to(device)
+    transform_criterion = nn.CrossEntropyLoss(weight=transform_class_weights, label_smoothing=args.label_smoothing)
+    coarse_transform_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    reaction_center_criterion = nn.BCEWithLogitsLoss()
+    enzyme_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     best_val_loss = None
     best_epoch = None
     show_progress = not args.no_progress
@@ -340,8 +472,16 @@ def main():
                 model,
                 batch,
                 optimizer,
-                criterion_ce,
+                sequence_criterion,
+                transform_criterion,
+                coarse_transform_criterion,
+                reaction_center_criterion,
+                enzyme_criterion,
                 device,
+                transform_loss_weight=args.transform_loss_weight,
+                coarse_transform_loss_weight=args.coarse_transform_loss_weight,
+                reaction_center_loss_weight=args.reaction_center_loss_weight,
+                enzyme_loss_weight=args.enzyme_loss_weight,
                 use_enzyme_head=args.use_enzyme_head,
             )
             losses.append(loss)
@@ -356,8 +496,16 @@ def main():
             val_metrics = evaluate(
                 model,
                 val_loader,
-                criterion_ce,
+                sequence_criterion,
+                transform_criterion,
+                coarse_transform_criterion,
+                reaction_center_criterion,
+                enzyme_criterion,
                 device,
+                transform_loss_weight=args.transform_loss_weight,
+                coarse_transform_loss_weight=args.coarse_transform_loss_weight,
+                reaction_center_loss_weight=args.reaction_center_loss_weight,
+                enzyme_loss_weight=args.enzyme_loss_weight,
                 use_enzyme_head=args.use_enzyme_head,
                 progress_desc="Validation",
                 show_progress=show_progress,
@@ -412,8 +560,16 @@ def main():
         test_metrics = evaluate(
             model,
             test_loader,
-            criterion_ce,
+            sequence_criterion,
+            transform_criterion,
+            coarse_transform_criterion,
+            reaction_center_criterion,
+            enzyme_criterion,
             device,
+            transform_loss_weight=args.transform_loss_weight,
+            coarse_transform_loss_weight=args.coarse_transform_loss_weight,
+            reaction_center_loss_weight=args.reaction_center_loss_weight,
+            enzyme_loss_weight=args.enzyme_loss_weight,
             use_enzyme_head=args.use_enzyme_head,
             progress_desc="Test",
             show_progress=show_progress,
@@ -437,12 +593,21 @@ def main():
                 "representation": args.representation,
                 "tokenizer": tokenizer.to_config(),
                 "num_transform_classes": len(transform_map),
+                "num_coarse_transform_classes": len(coarse_transform_map),
                 "num_enzyme_classes": len(enzyme_map) if args.use_enzyme_head else 0,
+                "atom_feature_dim": ATOM_FEATURE_DIM,
+                "bond_feature_dim": BOND_FEATURE_DIM,
                 "use_enzyme_head": args.use_enzyme_head,
+                "transform_loss_weight": args.transform_loss_weight,
+                "coarse_transform_loss_weight": args.coarse_transform_loss_weight,
+                "reaction_center_loss_weight": args.reaction_center_loss_weight,
+                "label_smoothing": args.label_smoothing,
+                "balance_transform_classes": args.balance_transform_classes,
                 "best_model_out": args.best_model_out if val_loader is not None else None,
                 "best_epoch": best_epoch,
                 "best_val_loss": best_val_loss,
                 "test_metrics": test_metrics,
+                "coarse_transform_map": coarse_transform_map,
                 "transform_map": transform_map,
                 "enzyme_map": enzyme_map,
             },
