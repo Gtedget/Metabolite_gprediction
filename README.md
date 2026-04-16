@@ -160,6 +160,19 @@ python Project-1\inference.py --model Project-1\artifacts\local_smoketest\traine
 ```
 
 
+SoM + enzyme ranking (no metabolite generation)
+
+If you want (a) multiple SoM-like atoms, (b) an explicit single-SoM selection rule, and (c) a likely-enzyme ranking layer that does not depend on generating metabolites, use:
+
+```powershell
+python Project-1\som_enzyme_inference.py --model Project-1\artifacts\local_smoketest\trained_model.best.pt --metadata Project-1\artifacts\local_smoketest\trained_model.metadata.json --precursor "CCO" --som_top_k 8 --som_threshold 0.5 --enzyme_top_k 5 --fallback_train_csv Project-1\train.csv --json_out Project-1\artifacts\local_smoketest\som_enzyme.json
+```
+
+Notes:
+- If the checkpoint includes an enzyme head (trained with `--use_enzyme_head`), the script reports top enzymes from that head.
+- Otherwise, `--fallback_train_csv` enables a simple frequency-based fallback that estimates $P(\text{enzyme})$ from the training data via transformation-family priors.
+
+
 Generation evaluation
 
 To evaluate structure generation on a split using canonical SMILES exact-match metrics:
