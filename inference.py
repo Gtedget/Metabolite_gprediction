@@ -42,6 +42,13 @@ def load_model(model_path: str, metadata_path: Optional[str], device: torch.devi
     num_enzyme_classes = 50
     use_enzyme_head = False
     metadata = {}
+    hidden_dim = 256
+    num_layers = 4
+    encoder_hidden_dim = 64
+    encoder_out_dim = 128
+    encoder_heads = 4
+    decoder_heads = 8
+    dropout = 0.1
 
     if metadata_path and os.path.exists(metadata_path):
         with open(metadata_path, "r") as f:
@@ -50,6 +57,13 @@ def load_model(model_path: str, metadata_path: Optional[str], device: torch.devi
         num_coarse_transform_classes = int(metadata.get("num_coarse_transform_classes", num_coarse_transform_classes))
         num_enzyme_classes = int(metadata.get("num_enzyme_classes", num_enzyme_classes))
         use_enzyme_head = bool(metadata.get("use_enzyme_head", use_enzyme_head))
+        hidden_dim = int(metadata.get("hidden_dim", hidden_dim))
+        num_layers = int(metadata.get("num_layers", num_layers))
+        encoder_hidden_dim = int(metadata.get("encoder_hidden_dim", encoder_hidden_dim))
+        encoder_out_dim = int(metadata.get("encoder_out_dim", encoder_out_dim))
+        encoder_heads = int(metadata.get("encoder_heads", encoder_heads))
+        decoder_heads = int(metadata.get("decoder_heads", decoder_heads))
+        dropout = float(metadata.get("dropout", dropout))
         tokenizer_config = metadata.get("tokenizer")
         if tokenizer_config:
             tokenizer = SmilesTokenizer.from_config(tokenizer_config)
@@ -68,12 +82,19 @@ def load_model(model_path: str, metadata_path: Optional[str], device: torch.devi
 
     model = MetaboliteGenerator(
         vocab_size=len(tokenizer.vocab),
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        encoder_hidden_dim=encoder_hidden_dim,
+        encoder_out_dim=encoder_out_dim,
+        encoder_heads=encoder_heads,
+        decoder_heads=decoder_heads,
         num_transform_classes=num_transform_classes,
         num_coarse_transform_classes=max(1, num_coarse_transform_classes),
         num_enzyme_classes=num_enzyme_classes,
         atom_feature_dim=atom_feature_dim,
         bond_feature_dim=bond_feature_dim,
         max_len=tokenizer.max_len,
+        dropout=dropout,
         use_enzyme_head=use_enzyme_head,
     )
 

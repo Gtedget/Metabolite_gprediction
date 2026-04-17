@@ -7,10 +7,10 @@ from data_utils import ATOM_FEATURE_DIM, BOND_FEATURE_DIM
 
 class GATEncoder(nn.Module):
     """Graph Attention Network encoder."""
-    def __init__(self, in_dim=ATOM_FEATURE_DIM, edge_dim=BOND_FEATURE_DIM, hidden_dim=64, out_dim=128, dropout=0.1):
+    def __init__(self, in_dim=ATOM_FEATURE_DIM, edge_dim=BOND_FEATURE_DIM, hidden_dim=64, out_dim=128, heads=4, dropout=0.1):
         super().__init__()
-        self.gat1 = GATConv(in_dim, hidden_dim, heads=4, concat=True, edge_dim=edge_dim)
-        self.gat2 = GATConv(hidden_dim * 4, out_dim, heads=4, concat=False, edge_dim=edge_dim)
+        self.gat1 = GATConv(in_dim, hidden_dim, heads=heads, concat=True, edge_dim=edge_dim)
+        self.gat2 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=edge_dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, batch):
@@ -33,27 +33,40 @@ class MetaboliteGenerator(nn.Module):
         vocab_size,
         hidden_dim=256,
         num_layers=4,
+        encoder_hidden_dim=64,
+        encoder_out_dim=128,
+        encoder_heads=4,
+        decoder_heads=8,
         num_transform_classes=20,
         num_coarse_transform_classes=8,
         num_enzyme_classes=50,
         atom_feature_dim=ATOM_FEATURE_DIM,
         bond_feature_dim=BOND_FEATURE_DIM,
         max_len=128,
+        dropout=0.1,
         use_enzyme_head=False,
     ):
         super().__init__()
 
-        self.encoder = GATEncoder(in_dim=atom_feature_dim, edge_dim=bond_feature_dim)
+        self.encoder = GATEncoder(
+            in_dim=atom_feature_dim,
+            edge_dim=bond_feature_dim,
+            hidden_dim=encoder_hidden_dim,
+            out_dim=encoder_out_dim,
+            heads=encoder_heads,
+            dropout=dropout,
+        )
 
         self.smiles_emb = nn.Embedding(vocab_size, hidden_dim)
         self.position_emb = nn.Embedding(max_len, hidden_dim)
-        self.memory_proj = nn.Linear(128, hidden_dim)
+        self.memory_proj = nn.Linear(encoder_out_dim, hidden_dim)
         self.coarse_transform_emb = nn.Embedding(max(1, num_coarse_transform_classes), hidden_dim)
         self.transform_emb = nn.Embedding(num_transform_classes, hidden_dim)
 
         layer = TransformerDecoderLayer(
             d_model=hidden_dim,
-            nhead=8,
+            nhead=decoder_heads,
+            dropout=dropout,
             batch_first=True
         )
         self.decoder = TransformerDecoder(layer, num_layers=num_layers)
@@ -61,15 +74,15 @@ class MetaboliteGenerator(nn.Module):
         self.output_layer = nn.Linear(hidden_dim, vocab_size)
 
         self.reaction_center_head = nn.Sequential(
-            nn.Linear(128, 128),
+            nn.Linear(encoder_out_dim, encoder_out_dim),
             nn.ReLU(),
-            nn.Linear(128, 1),
+            nn.Linear(encoder_out_dim, 1),
         )
-        self.coarse_transform_head = nn.Linear(128, max(1, num_coarse_transform_classes))
-        self.transform_head = nn.Linear(128, num_transform_classes)
+        self.coarse_transform_head = nn.Linear(encoder_out_dim, max(1, num_coarse_transform_classes))
+        self.transform_head = nn.Linear(encoder_out_dim, num_transform_classes)
         self.enzyme_head = None
         if use_enzyme_head and num_enzyme_classes > 0:
-            self.enzyme_head = nn.Linear(128, num_enzyme_classes)
+            self.enzyme_head = nn.Linear(encoder_out_dim, num_enzyme_classes)
 
     def forward(self, graph, tgt_tokens, transform_labels=None, coarse_transform_labels=None):
         """

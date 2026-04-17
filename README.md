@@ -130,6 +130,22 @@ Example:
 python Project-1\train.py --data Project-1\train.csv --epochs 20 --batch_size 16 --lr 1e-4 --output_dir Project-1\artifacts --run_name local_smoketest
 ```
 
+For this dataset, simply increasing epochs is usually not enough because the detailed `Transformation` label space is extremely sparse. Two practical knobs were added for Colab experiments:
+
+- `--oversample_strategy transform` or `--oversample_strategy coarse_transform` enables weighted oversampling of minority labels in the training loader.
+- `--oversample_power 0.5` is usually a safer starting point than `1.0` because it reduces imbalance without duplicating the rarest classes too aggressively.
+- `--scheduler plateau --scheduler_patience 3 --scheduler_factor 0.5` reduces the learning rate when validation loss stalls.
+- `--early_stopping_patience 6` stops long runs once validation loss stops improving.
+- `--hidden_dim`, `--num_layers`, `--encoder_hidden_dim`, `--encoder_out_dim`, `--encoder_heads`, `--decoder_heads`, `--dropout`, `--weight_decay`, and `--grad_clip` expose the main architecture and optimization hyperparameters for sweeps.
+
+Recommended Colab starting point:
+
+```powershell
+python Project-1\train.py --data Project-1\train.csv --val_data Project-1\val.csv --test_data Project-1\test.csv --epochs 30 --batch_size 32 --lr 3e-4 --weight_decay 1e-4 --dropout 0.2 --hidden_dim 256 --num_layers 4 --encoder_hidden_dim 64 --encoder_out_dim 128 --oversample_strategy coarse_transform --oversample_power 0.5 --balance_transform_classes --scheduler plateau --scheduler_patience 3 --scheduler_factor 0.5 --early_stopping_patience 6 --device cuda --output_dir Project-1\artifacts --run_name colab_balanced_v1
+```
+
+If the detailed transformation accuracy remains low, that is expected for the current split: many fine-grained labels have only 1 to 2 examples in training, and some validation/test labels are unseen during training. In that case, prioritize the coarse transformation-family head and metabolite-generation metrics over exact 244-class transformation accuracy.
+
 
 Inference
 

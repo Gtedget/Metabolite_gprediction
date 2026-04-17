@@ -21,6 +21,10 @@ def main():
     parser.add_argument("--metadata", required=True, help="Path to metadata JSON")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--disable_pin_memory", action="store_true")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision during evaluation on CUDA")
     parser.add_argument("--no_progress", action="store_true")
     args = parser.parse_args()
 
@@ -41,7 +45,17 @@ def main():
         enzyme_map=enzyme_map,
         coarse_transform_map=coarse_transform_map,
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    pin_memory = bool(device.type == "cuda" and not args.disable_pin_memory)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "shuffle": False,
+        "num_workers": args.num_workers,
+        "pin_memory": pin_memory,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    loader = DataLoader(dataset, **loader_kwargs)
 
     sequence_criterion = nn.CrossEntropyLoss(ignore_index=0)
     transform_criterion = nn.CrossEntropyLoss()
@@ -62,6 +76,7 @@ def main():
         coarse_transform_loss_weight=float(metadata.get("coarse_transform_loss_weight", 0.2)),
         reaction_center_loss_weight=float(metadata.get("reaction_center_loss_weight", 0.2)),
         enzyme_loss_weight=float(metadata.get("enzyme_loss_weight", 0.3)),
+        amp_enabled=bool(args.amp and device.type == "cuda"),
         use_enzyme_head=bool(metadata.get("use_enzyme_head", False)),
         progress_desc="Eval",
         show_progress=not args.no_progress,

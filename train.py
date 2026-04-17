@@ -1,8 +1,10 @@
 """Train a GAT+Transformer model for metabolite SMILES generation and transformation prediction."""
 
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch_geometric.loader import DataLoader
+from torch.utils.data import WeightedRandomSampler
 from data_utils import BOND_FEATURE_DIM, ATOM_FEATURE_DIM, MetaboliteDataset, SmilesTokenizer, normalize_transformation_family
 from model import MetaboliteGenerator
 import pandas as pd
@@ -66,12 +68,32 @@ def setup_mlflow(args, train_df, val_df=None, test_df=None):
             "epochs": args.epochs,
             "batch_size": args.batch_size,
             "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "grad_clip": args.grad_clip,
             "representation": args.representation,
             "max_len": args.max_len,
+            "hidden_dim": args.hidden_dim,
+            "num_layers": args.num_layers,
+            "encoder_hidden_dim": args.encoder_hidden_dim,
+            "encoder_out_dim": args.encoder_out_dim,
+            "encoder_heads": args.encoder_heads,
+            "decoder_heads": args.decoder_heads,
+            "dropout": args.dropout,
             "run_name": args.run_name,
             "output_dir": args.output_dir,
             "device": args.device,
             "use_enzyme_head": args.use_enzyme_head,
+            "oversample_strategy": args.oversample_strategy,
+            "oversample_power": args.oversample_power,
+            "scheduler": args.scheduler,
+            "scheduler_patience": args.scheduler_patience,
+            "scheduler_factor": args.scheduler_factor,
+            "min_lr": args.min_lr,
+            "early_stopping_patience": args.early_stopping_patience,
+            "amp": args.amp,
+            "num_workers": args.num_workers,
+            "prefetch_factor": args.prefetch_factor,
+            "pin_memory": not args.disable_pin_memory,
             "train_rows": len(train_df),
             "val_rows": len(val_df) if val_df is not None else 0,
             "test_rows": len(test_df) if test_df is not None else 0,
@@ -137,6 +159,20 @@ def build_class_weights(df, column_name, label_map):
     return weights / weights.mean()
 
 
+def build_sample_weights(df, strategy, power=1.0):
+    if strategy == "transform":
+        labels = df["Transformation"].astype(str)
+    elif strategy == "coarse_transform":
+        labels = df["Transformation"].map(normalize_transformation_family)
+    else:
+        raise ValueError(f"Unsupported oversampling strategy: {strategy}")
+
+    counts = labels.value_counts()
+    sample_weights = labels.map(lambda value: 1.0 / max(float(counts[value]), 1.0))
+    sample_weights = sample_weights.pow(power)
+    return torch.tensor(sample_weights.to_numpy(), dtype=torch.double)
+
+
 def build_coarse_transform_map(train_df, val_df=None, test_df=None):
     frames = [train_df]
     if val_df is not None:
@@ -150,6 +186,29 @@ def build_coarse_transform_map(train_df, val_df=None, test_df=None):
 
     coarse_labels = sorted(set(coarse_labels))
     return {label: idx for idx, label in enumerate(coarse_labels)}
+
+
+def get_autocast_context(device, amp_enabled):
+    if amp_enabled and device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
+
+
+def build_loader_kwargs(batch_size, num_workers, pin_memory, prefetch_factor, sampler=None, shuffle=False):
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
+    else:
+        loader_kwargs["shuffle"] = shuffle
+
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    return loader_kwargs
 
 
 def compute_batch_loss(
@@ -232,28 +291,42 @@ def train_step(
     coarse_transform_loss_weight=0.2,
     reaction_center_loss_weight=0.2,
     enzyme_loss_weight=0.3,
+    grad_clip=0.0,
+    scaler=None,
+    amp_enabled=False,
     use_enzyme_head=False,
 ):
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
-    loss, transform_accuracy = compute_batch_loss(
-        model,
-        batch,
-        sequence_criterion,
-        transform_criterion,
-        coarse_transform_criterion,
-        reaction_center_criterion,
-        enzyme_criterion,
-        device,
-        transform_loss_weight=transform_loss_weight,
-        coarse_transform_loss_weight=coarse_transform_loss_weight,
-        reaction_center_loss_weight=reaction_center_loss_weight,
-        enzyme_loss_weight=enzyme_loss_weight,
-        use_enzyme_head=use_enzyme_head,
-    )
+    with get_autocast_context(device, amp_enabled):
+        loss, transform_accuracy = compute_batch_loss(
+            model,
+            batch,
+            sequence_criterion,
+            transform_criterion,
+            coarse_transform_criterion,
+            reaction_center_criterion,
+            enzyme_criterion,
+            device,
+            transform_loss_weight=transform_loss_weight,
+            coarse_transform_loss_weight=coarse_transform_loss_weight,
+            reaction_center_loss_weight=reaction_center_loss_weight,
+            enzyme_loss_weight=enzyme_loss_weight,
+            use_enzyme_head=use_enzyme_head,
+        )
 
-    loss.backward()
-    optimizer.step()
+    if scaler is not None and amp_enabled:
+        scaler.scale(loss).backward()
+        if grad_clip > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        if grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
 
     return loss.item(), transform_accuracy
 
@@ -272,6 +345,7 @@ def evaluate(
     coarse_transform_loss_weight=0.2,
     reaction_center_loss_weight=0.2,
     enzyme_loss_weight=0.3,
+    amp_enabled=False,
     use_enzyme_head=False,
     progress_desc=None,
     show_progress=False,
@@ -285,21 +359,22 @@ def evaluate(
         batch_iter = tqdm(loader, desc=progress_desc, leave=False)
 
     for batch in batch_iter:
-        loss, transform_accuracy = compute_batch_loss(
-            model,
-            batch,
-            sequence_criterion,
-            transform_criterion,
-            coarse_transform_criterion,
-            reaction_center_criterion,
-            enzyme_criterion,
-            device,
-            transform_loss_weight=transform_loss_weight,
-            coarse_transform_loss_weight=coarse_transform_loss_weight,
-            reaction_center_loss_weight=reaction_center_loss_weight,
-            enzyme_loss_weight=enzyme_loss_weight,
-            use_enzyme_head=use_enzyme_head,
-        )
+        with get_autocast_context(device, amp_enabled):
+            loss, transform_accuracy = compute_batch_loss(
+                model,
+                batch,
+                sequence_criterion,
+                transform_criterion,
+                coarse_transform_criterion,
+                reaction_center_criterion,
+                enzyme_criterion,
+                device,
+                transform_loss_weight=transform_loss_weight,
+                coarse_transform_loss_weight=coarse_transform_loss_weight,
+                reaction_center_loss_weight=reaction_center_loss_weight,
+                enzyme_loss_weight=enzyme_loss_weight,
+                use_enzyme_head=use_enzyme_head,
+            )
         losses.append(loss.item())
         transform_accuracies.append(transform_accuracy)
 
@@ -316,8 +391,17 @@ def main():
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.0, help="AdamW weight decay")
+    parser.add_argument("--grad_clip", type=float, default=0.0, help="Optional gradient clipping norm; disabled when <= 0")
     parser.add_argument("--representation", choices=["smiles", "selfies"], default="selfies")
     parser.add_argument("--max_len", type=int, default=128)
+    parser.add_argument("--hidden_dim", type=int, default=256, help="Transformer hidden size")
+    parser.add_argument("--num_layers", type=int, default=4, help="Number of decoder layers")
+    parser.add_argument("--encoder_hidden_dim", type=int, default=64, help="Hidden size of the first GAT layer")
+    parser.add_argument("--encoder_out_dim", type=int, default=128, help="Output size of the GAT encoder")
+    parser.add_argument("--encoder_heads", type=int, default=4, help="Number of GAT attention heads")
+    parser.add_argument("--decoder_heads", type=int, default=8, help="Number of transformer decoder heads")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout applied in the encoder and decoder")
     parser.add_argument("--output_dir", default="artifacts", help="Base directory for run outputs when default artifact names are used")
     parser.add_argument("--run_name", default=None, help="Optional run name used for artifact subdirectories and MLflow")
     parser.add_argument("--log_file", default=None, help="Optional path to append training progress logs")
@@ -344,6 +428,37 @@ def main():
     parser.add_argument("--enzyme_loss_weight", type=float, default=0.3, help="Weight applied to the enzyme classification loss when enabled")
     parser.add_argument("--label_smoothing", type=float, default=0.0, help="Optional label smoothing applied to sequence and classification cross-entropy losses")
     parser.add_argument("--balance_transform_classes", action="store_true", help="Use inverse-frequency class weights for the transformation loss")
+    parser.add_argument(
+        "--oversample_strategy",
+        choices=["none", "transform", "coarse_transform"],
+        default="none",
+        help="Optional weighted oversampling of minority classes in the training loader",
+    )
+    parser.add_argument(
+        "--oversample_power",
+        type=float,
+        default=1.0,
+        help="Exponent applied to inverse-frequency sample weights; 0.5 is gentler than 1.0",
+    )
+    parser.add_argument(
+        "--scheduler",
+        choices=["none", "plateau", "cosine"],
+        default="none",
+        help="Optional learning-rate scheduler",
+    )
+    parser.add_argument("--scheduler_patience", type=int, default=3, help="Patience for ReduceLROnPlateau")
+    parser.add_argument("--scheduler_factor", type=float, default=0.5, help="Factor for ReduceLROnPlateau")
+    parser.add_argument("--min_lr", type=float, default=1e-6, help="Minimum scheduler learning rate")
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of dataloader workers")
+    parser.add_argument("--prefetch_factor", type=int, default=2, help="Prefetch factor used when num_workers > 0")
+    parser.add_argument("--disable_pin_memory", action="store_true", help="Disable DataLoader pin_memory even on CUDA")
+    parser.add_argument("--amp", action="store_true", help="Enable automatic mixed precision on CUDA for faster Colab GPU training")
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=0,
+        help="Stop training after this many non-improving validation epochs; disabled when <= 0",
+    )
     parser.add_argument(
         "--use_enzyme_head",
         action="store_true",
@@ -375,6 +490,13 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
+
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    pin_memory = bool(device.type == "cuda" and not args.disable_pin_memory)
 
     if args.val_data is None:
         args.val_data = resolve_default_path(args.data, "val.csv")
@@ -411,7 +533,29 @@ def main():
         coarse_transform_map=coarse_transform_map,
     )
 
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    if args.oversample_strategy != "none":
+        train_sample_weights = build_sample_weights(df, args.oversample_strategy, power=args.oversample_power)
+        train_sampler = WeightedRandomSampler(
+            weights=train_sample_weights,
+            num_samples=len(train_sample_weights),
+            replacement=True,
+        )
+        loader_kwargs = build_loader_kwargs(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=args.prefetch_factor,
+            sampler=train_sampler,
+        )
+    else:
+        loader_kwargs = build_loader_kwargs(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=args.prefetch_factor,
+            shuffle=True,
+        )
+    loader = DataLoader(dataset, **loader_kwargs)
     val_loader = None
     if val_df is not None:
         val_dataset = MetaboliteDataset(
@@ -422,7 +566,16 @@ def main():
             enzyme_map=enzyme_map,
             coarse_transform_map=coarse_transform_map,
         )
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+        val_loader = DataLoader(
+            val_dataset,
+            **build_loader_kwargs(
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+                prefetch_factor=args.prefetch_factor,
+                shuffle=False,
+            ),
+        )
 
     test_loader = None
     if test_df is not None:
@@ -434,20 +587,51 @@ def main():
             enzyme_map=enzyme_map,
             coarse_transform_map=coarse_transform_map,
         )
-        test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+        test_loader = DataLoader(
+            test_dataset,
+            **build_loader_kwargs(
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+                prefetch_factor=args.prefetch_factor,
+                shuffle=False,
+            ),
+        )
 
     model = MetaboliteGenerator(
         vocab_size=len(tokenizer.vocab),
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        encoder_hidden_dim=args.encoder_hidden_dim,
+        encoder_out_dim=args.encoder_out_dim,
+        encoder_heads=args.encoder_heads,
+        decoder_heads=args.decoder_heads,
         num_transform_classes=len(transform_map),
         num_coarse_transform_classes=len(coarse_transform_map),
         num_enzyme_classes=len(enzyme_map),
         atom_feature_dim=ATOM_FEATURE_DIM,
         bond_feature_dim=BOND_FEATURE_DIM,
         max_len=tokenizer.max_len,
+        dropout=args.dropout,
         use_enzyme_head=args.use_enzyme_head,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = None
+    if args.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.scheduler_factor,
+            patience=args.scheduler_patience,
+            min_lr=args.min_lr,
+        )
+    elif args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs),
+            eta_min=args.min_lr,
+        )
     sequence_criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=args.label_smoothing)
     transform_class_weights = None
     if args.balance_transform_classes:
@@ -458,6 +642,7 @@ def main():
     enzyme_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     best_val_loss = None
     best_epoch = None
+    epochs_without_improvement = 0
     show_progress = not args.no_progress
 
     for epoch in range(args.epochs):
@@ -482,6 +667,9 @@ def main():
                 coarse_transform_loss_weight=args.coarse_transform_loss_weight,
                 reaction_center_loss_weight=args.reaction_center_loss_weight,
                 enzyme_loss_weight=args.enzyme_loss_weight,
+                grad_clip=args.grad_clip,
+                scaler=scaler,
+                amp_enabled=amp_enabled,
                 use_enzyme_head=args.use_enzyme_head,
             )
             losses.append(loss)
@@ -506,6 +694,7 @@ def main():
                 coarse_transform_loss_weight=args.coarse_transform_loss_weight,
                 reaction_center_loss_weight=args.reaction_center_loss_weight,
                 enzyme_loss_weight=args.enzyme_loss_weight,
+                amp_enabled=amp_enabled,
                 use_enzyme_head=args.use_enzyme_head,
                 progress_desc="Validation",
                 show_progress=show_progress,
@@ -531,10 +720,31 @@ def main():
             if best_val_loss is None or val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]
                 best_epoch = epoch
+                epochs_without_improvement = 0
                 torch.save(model.state_dict(), args.best_model_out)
                 log_message(f"Saved best checkpoint to: {args.best_model_out}", log_file=args.log_file)
                 if mlflow_enabled:
                     log_mlflow_metrics({"best_val_loss": best_val_loss, "best_epoch": float(best_epoch)}, step=epoch)
+            else:
+                epochs_without_improvement += 1
+
+            if scheduler is not None:
+                if args.scheduler == "plateau":
+                    scheduler.step(val_metrics["loss"])
+                else:
+                    scheduler.step()
+
+            current_lr = optimizer.param_groups[0]["lr"]
+            log_message(f"Epoch {epoch}: lr={current_lr:.6g}", log_file=args.log_file)
+            if mlflow_enabled:
+                log_mlflow_metrics({"lr": current_lr}, step=epoch)
+
+            if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+                log_message(
+                    f"Early stopping triggered after {epochs_without_improvement} non-improving validation epochs.",
+                    log_file=args.log_file,
+                )
+                break
         else:
             log_message(
                 f"Epoch {epoch}: train_loss={train_loss:.4f} "
@@ -549,6 +759,15 @@ def main():
                     },
                     step=epoch,
                 )
+            if scheduler is not None:
+                if args.scheduler == "plateau":
+                    scheduler.step(train_loss)
+                else:
+                    scheduler.step()
+                current_lr = optimizer.param_groups[0]["lr"]
+                log_message(f"Epoch {epoch}: lr={current_lr:.6g}", log_file=args.log_file)
+                if mlflow_enabled:
+                    log_mlflow_metrics({"lr": current_lr}, step=epoch)
 
     torch.save(model.state_dict(), args.model_out)
 
@@ -570,6 +789,7 @@ def main():
             coarse_transform_loss_weight=args.coarse_transform_loss_weight,
             reaction_center_loss_weight=args.reaction_center_loss_weight,
             enzyme_loss_weight=args.enzyme_loss_weight,
+            amp_enabled=amp_enabled,
             use_enzyme_head=args.use_enzyme_head,
             progress_desc="Test",
             show_progress=show_progress,
@@ -592,6 +812,15 @@ def main():
             {
                 "representation": args.representation,
                 "tokenizer": tokenizer.to_config(),
+                "hidden_dim": args.hidden_dim,
+                "num_layers": args.num_layers,
+                "encoder_hidden_dim": args.encoder_hidden_dim,
+                "encoder_out_dim": args.encoder_out_dim,
+                "encoder_heads": args.encoder_heads,
+                "decoder_heads": args.decoder_heads,
+                "dropout": args.dropout,
+                "weight_decay": args.weight_decay,
+                "grad_clip": args.grad_clip,
                 "num_transform_classes": len(transform_map),
                 "num_coarse_transform_classes": len(coarse_transform_map),
                 "num_enzyme_classes": len(enzyme_map) if args.use_enzyme_head else 0,
@@ -603,6 +832,17 @@ def main():
                 "reaction_center_loss_weight": args.reaction_center_loss_weight,
                 "label_smoothing": args.label_smoothing,
                 "balance_transform_classes": args.balance_transform_classes,
+                "oversample_strategy": args.oversample_strategy,
+                "oversample_power": args.oversample_power,
+                "scheduler": args.scheduler,
+                "scheduler_patience": args.scheduler_patience,
+                "scheduler_factor": args.scheduler_factor,
+                "min_lr": args.min_lr,
+                "early_stopping_patience": args.early_stopping_patience,
+                "amp": args.amp,
+                "num_workers": args.num_workers,
+                "prefetch_factor": args.prefetch_factor,
+                "pin_memory": pin_memory,
                 "best_model_out": args.best_model_out if val_loader is not None else None,
                 "best_epoch": best_epoch,
                 "best_val_loss": best_val_loss,

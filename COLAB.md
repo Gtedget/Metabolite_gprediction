@@ -31,6 +31,21 @@ If you do not want Google Drive, use:
 MLFLOW_URI = 'file:/content/mlruns'
 ```
 
+If your processed dataset is not checked into the repository, keep it in Google Drive and point Colab at that folder:
+
+```python
+from pathlib import Path
+
+DATA_DIR = Path('/content/drive/MyDrive/metabolite_data')
+TRAIN_CSV = DATA_DIR / 'train.csv'
+VAL_CSV = DATA_DIR / 'val.csv'
+TEST_CSV = DATA_DIR / 'test.csv'
+TRANSFORM_MAP_JSON = DATA_DIR / 'transform_map.json'
+ENZYME_MAP_JSON = DATA_DIR / 'enzyme_map.json'
+```
+
+The training script will also look for a sibling `processed_metabolism_data.csv` next to `train.csv` when building the tokenizer.
+
 5. Train on GPU with MLflow enabled:
 
 ```python
@@ -38,12 +53,27 @@ from datetime import datetime
 RUN_NAME = datetime.utcnow().strftime('colab_%Y%m%d_%H%M%S')
 
 !python train.py \
-  --data train.csv \
-  --epochs 20 \
-  --batch_size 16 \
-  --lr 1e-4 \
+  --data {TRAIN_CSV} \
+  --val_data {VAL_CSV} \
+  --test_data {TEST_CSV} \
+  --transform_map {TRANSFORM_MAP_JSON} \
+  --enzyme_map {ENZYME_MAP_JSON} \
+  --epochs 30 \
+  --batch_size 32 \
+  --lr 3e-4 \
+  --weight_decay 1e-4 \
+  --dropout 0.2 \
   --device cuda \
   --representation selfies \
+  --balance_transform_classes \
+  --oversample_strategy coarse_transform \
+  --oversample_power 0.5 \
+  --scheduler plateau \
+  --scheduler_patience 3 \
+  --scheduler_factor 0.5 \
+  --early_stopping_patience 6 \
+  --num_workers 2 \
+  --amp \
   --output_dir artifacts \
   --run_name "$RUN_NAME" \
   --use_mlflow \
@@ -55,7 +85,7 @@ RUN_NAME = datetime.utcnow().strftime('colab_%Y%m%d_%H%M%S')
 
 ```python
 !python evaluate_generation.py \
-  --data test.csv \
+  --data {TEST_CSV} \
   --model "artifacts/$RUN_NAME/trained_model.best.pt" \
   --metadata "artifacts/$RUN_NAME/trained_model.metadata.json" \
   --top_k 5 \
